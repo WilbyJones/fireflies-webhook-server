@@ -1,7 +1,6 @@
 const express = require("express");
 const { Client } = require("@hubspot/api-client");
 
-const express = require("express");
 const app = express();
 app.use(express.json());
 
