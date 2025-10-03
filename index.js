@@ -1,54 +1,109 @@
 const express = require("express");
 const { Client } = require("@hubspot/api-client");
 const app = express();
-
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const HUBSPOT_API_KEY = process.env.HUBSPOT_API_KEY;
+
 if (!HUBSPOT_API_KEY) {
   throw new Error("HUBSPOT_API_KEY environment variable is missing!");
 }
+
 const hubspotClient = new Client({ accessToken: HUBSPOT_API_KEY });
 
 app.get("/", (req, res) => {
-  res.send("Server is running!");
+  res.send("Fireflies-HubSpot Integration Server is running!");
 });
 
-app.post("/webhook", async (req, res) => {
-  console.log("Webhook received from Fireflies.ai:", req.body);
-
-  const meetingData = req.body;
-  const meetingTitle = meetingData.title; // adjust to Fireflies payload keys
-
+// Fireflies webhook endpoint
+app.post("/fireflies-webhook", async (req, res) => {
+  console.log("Fireflies webhook received:", req.body);
+  
   try {
-    // Search meetings in HubSpot by title (improve by also filtering by time, etc.)
-    const searchResponse = await hubspotClient.crm.objects.meetings.basicApi.getPage(
-      10,
-      undefined,
-      undefined,
-      ["hs_meeting_title"]
-    );
-    const meetings = searchResponse.body.results || [];
-    const matchedMeeting = meetings.find(
-      (m) => m.properties.hs_meeting_title === meetingTitle
-    );
-
-    if (!matchedMeeting) {
-      res.status(404).send("Meeting not found");
-      return;
+    const { meetingId, eventType } = req.body;
+    
+    if (eventType !== "Transcription completed") {
+      return res.status(200).send("Event type not handled");
     }
 
-    // Update meeting status to "COMPLETED"
-    await hubspotClient.crm.objects.meetings.basicApi.update(matchedMeeting.id, {
-      properties: { hs_meeting_outcome: "COMPLETED" },
+    // Get transcript data from Fireflies
+    const transcriptResponse = await fetch('https://api.fireflies.ai/graphql', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.FIREFLIES_API_KEY}`
+      },
+      body: JSON.stringify({
+        query: `
+          query($transcriptId: String!) {
+            transcript(id: $transcriptId) {
+              title
+              date
+              duration
+              attendees {
+                name
+                email
+              }
+            }
+          }
+        `,
+        variables: { transcriptId: meetingId }
+      })
+    });
+    
+    const transcriptData = await transcriptResponse.json();
+    const meeting = transcriptData.data.transcript;
+    
+    // Search for HubSpot meetings by multiple criteria
+    const searchFilter = {
+      filterGroups: [{
+        filters: [
+          {
+            propertyName: "hs_meeting_title",
+            operator: "CONTAINS_TOKEN",
+            value: meeting.title
+          },
+          {
+            propertyName: "hs_meeting_start_time",
+            operator: "BETWEEN",
+            value: meeting.date, // Add date range logic
+            highValue: meeting.date + 3600000 // 1 hour window
+          }
+        ]
+      }]
+    };
+
+    const searchResponse = await hubspotClient.crm.objects.meetings.searchApi.doSearch({
+      filterGroups: searchFilter.filterGroups,
+      properties: ["hs_meeting_title", "hs_meeting_outcome", "hs_meeting_start_time"]
     });
 
-    res.send("HubSpot meeting updated: COMPLETED");
+    if (!searchResponse.results || searchResponse.results.length === 0) {
+      return res.status(404).send("No matching HubSpot meeting found");
+    }
+
+    // Update the first matching meeting
+    const hubspotMeeting = searchResponse.results[0];
+    await hubspotClient.crm.objects.meetings.basicApi.update(hubspotMeeting.id, {
+      properties: { 
+        hs_meeting_outcome: "COMPLETED",
+        hs_meeting_body: `Meeting transcribed by Fireflies.ai. Duration: ${meeting.duration} minutes.`
+      }
+    });
+
+    res.status(200).send(`HubSpot meeting ${hubspotMeeting.id} updated to COMPLETED`);
+
   } catch (error) {
-    console.error("HubSpot API error:", error);
-    res.status(500).send("API update failed");
+    console.error("Fireflies webhook error:", error);
+    res.status(500).send("Webhook processing failed");
   }
+});
+
+// HubSpot webhook endpoint (for future bidirectional sync)
+app.post("/hubspot-webhook", async (req, res) => {
+  console.log("HubSpot webhook received:", req.body);
+  res.status(200).send("HubSpot webhook received");
 });
 
 app.listen(PORT, () => {
